@@ -30,6 +30,7 @@ def process_depth(ref_depth, ref_image, src_depths, src_images, ref_P, src_Ps, r
     pts_xx, pts_yy = np.meshgrid(pts_x, pts_y)
 
     pts = torch.from_numpy(np.stack((pts_xx, pts_yy, np.ones_like(pts_xx)), axis=0)).float().cuda()
+    # (u,v) pixel coordinate in reference frame ---(reproject)---> (x,y,z) world coordinate
     pts = ref_P_inv[:3, :3] @ (ref_K_inv @ (pts * ref_depth.unsqueeze(0)).view(3, n_pts))\
           + ref_P_inv[:3, 3, None]
 
@@ -48,10 +49,12 @@ def process_depth(ref_depth, ref_image, src_depths, src_images, ref_P, src_Ps, r
         n_batch_imgs = idx_end - idx_start
         pts_reproj = torch.bmm(src_Ps_batch[:, :3, :3],
                                pts.unsqueeze(0).repeat(n_batch_imgs, 1, 1)) + src_Ps_batch[:, :3, 3, None]
+        # (x,y,z) world coordinate ---(project)---> (u, v) pixel coordinate in source frames
         pts_reproj = torch.bmm(src_Ks_batch, pts_reproj)
         z_reproj = pts_reproj[:, 2]
         pts_reproj = pts_reproj / z_reproj.unsqueeze(1)
 
+        # [Core Rule][1]: reproject ref pts in src frame should in src pyramid
         valid_z = (z_reproj > 1e-4)
         valid_x = (pts_reproj[:, 0] >= 0.) & (pts_reproj[:, 0] <= float(w - 1))
         valid_y = (pts_reproj[:, 1] >= 0.) & (pts_reproj[:, 1] <= float(h - 1))
@@ -62,11 +65,11 @@ def process_depth(ref_depth, ref_image, src_depths, src_images, ref_P, src_Ps, r
         z_sample = F.grid_sample(src_depths_batch.unsqueeze(1), grid, mode='nearest', align_corners=True,
                                  padding_mode='zeros')
         z_sample = z_sample.squeeze(1).squeeze(-1)
-
-        z_diff = torch.abs(z_reproj - z_sample)
+        # [Core Rule][2]: differece between reproject and sample for each pixel in SOURCE frames
+        z_diff = torch.abs(z_reproj - z_sample) 
         valid_disp = z_diff < z_thresh
 
-        valid_per_src = (valid_disp & valid_x & valid_y & valid_z)
+        valid_per_src = (valid_disp & valid_x & valid_y & valid_z)  # shape: (n_batch_imgs, n_pts)
         n_valid += torch.sum(valid_per_src.int(), dim=0)
 
         # back project sampled pts for later averaging
@@ -78,9 +81,10 @@ def process_depth(ref_depth, ref_image, src_depths, src_images, ref_P, src_Ps, r
     pts_sample_all = torch.cat(pts_sample_all, dim=0)
     valid_per_src_all = torch.cat(valid_per_src_all, dim=0)
 
+    # [Core Rule][3]：valid point-pairs in more than 3 src frames
     valid = n_valid >= n_consistent_thresh
 
-    # average sampled points amongst consistent views
+    # average sampled points (from src views) amongst consistent views
     pts_avg = pts
     for i in range(n_src_imgs):
         pts_sample_i = pts_sample_all[i]
